@@ -67,6 +67,24 @@ function heap(pts, o0, o1, h) {
   const n = g.attributes.normal.array; for (let k = 1; k < n.length; k += 3) n[k] = Math.abs(n[k]) + .2; // keep faces lit at sharp turns
   return g;
 }
+// concatenate geometries into one draw call (optionally with a colour per part)
+function merge(geos, colors) {
+  const parts = geos.map(g => g.index ? g.toNonIndexed() : g);
+  const n = parts.reduce((s, q) => s + q.attributes.position.count, 0);
+  const pos = new Float32Array(n * 3), nor = new Float32Array(n * 3), uv = new Float32Array(n * 2), col = colors && new Float32Array(n * 3);
+  let o = 0;
+  parts.forEach((q, i) => {
+    const c = q.attributes.position.count;
+    pos.set(q.attributes.position.array, o * 3); nor.set(q.attributes.normal.array, o * 3);
+    if (q.attributes.uv) uv.set(q.attributes.uv.array, o * 2);
+    if (col) for (let k = 0; k < c; k++) colors[i].toArray(col, (o + k) * 3);
+    o += c;
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3)); g.setAttribute("normal", new THREE.BufferAttribute(nor, 3)); g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+  if (col) g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  return g;
+}
 const len = pts => pts.reduce((s, p, i) => i ? s + Math.hypot(p[0] - pts[i - 1][0], p[1] - pts[i - 1][1]) : 0, 0);
 
 export async function init(canvas, drawingURL) {
@@ -78,15 +96,18 @@ export async function init(canvas, drawingURL) {
 
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: "high-performance" });
   renderer.setClearColor(0x000000, 0);
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.75));
-  renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  // resolution: capped, and lowered further if frames run slow
+  let dpr = Math.min(devicePixelRatio, innerWidth < 760 ? 1.25 : 1.5);
+  renderer.setPixelRatio(dpr);
+  // the scene is static, so the shadow map is drawn once, not every frame
+  renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFShadowMap; renderer.shadowMap.autoUpdate = false;
   renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.05;
 
   const scene = new THREE.Scene();
   scene.fog = new THREE.Fog(C.haze.clone(), 30, 420);
   const camera = new THREE.PerspectiveCamera(42, 1, .1, 4000);
 
-  scene.add(new THREE.HemisphereLight("#fff4e4", "#7a5a44", 1.1));
+  const hemi = new THREE.HemisphereLight("#fff4e4", "#7a5a44", 1.1); scene.add(hemi);
   const sun = new THREE.DirectionalLight("#ffd7ad", 2.6);
   sun.position.set(-180, 160, 120); sun.castShadow = true;
   Object.assign(sun.shadow.camera, { left: -300, right: 300, top: 300, bottom: -300, far: 800 });
@@ -106,43 +127,46 @@ export async function init(canvas, drawingURL) {
 
   // roads
   const roadM = new THREE.MeshStandardMaterial({ color: C.road, roughness: .95, transparent: true, side: THREE.DoubleSide });
-  data.roads.forEach(r => { const m = new THREE.Mesh(ribbon(r, 6.5, .012), roadM); m.receiveShadow = true; scene.add(m); });
+  if (data.roads.length) { const rm = new THREE.Mesh(merge(data.roads.map(r => ribbon(r, 6.5, .012))), roadM); rm.receiveShadow = true; scene.add(rm); }
 
   // houses, extruded from plot outlines
   const houses = new THREE.Group(), tones = ["#e7c9b1", "#d8b096", "#efe0d2", "#c99c82", "#e2bfa6"].map(c => new THREE.Color(c));
-  const houseMats = tones.map(c => new THREE.MeshStandardMaterial({ color: c.clone(), roughness: .92 }));
-  const edgePos = [];
+  const houseM = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: .92, side: THREE.DoubleSide });
+  const edgePos = [], hg = [], hc = [];
   data.houses.forEach((h, i) => {
     const shape = new THREE.Shape(h.p.map(([x, z]) => new THREE.Vector2(x, -z)));
     const g = new THREE.ExtrudeGeometry(shape, { depth: h.h, bevelEnabled: false });
-    g.rotateX(-Math.PI / 2);
-    const m = new THREE.Mesh(g, houseMats[i % houseMats.length]); m.material.side = THREE.DoubleSide; m.castShadow = m.receiveShadow = true; houses.add(m);
+    g.rotateX(-Math.PI / 2); hg.push(g); hc.push(tones[i % tones.length]);
     const e = new THREE.EdgesGeometry(g, 30).attributes.position.array; for (let k = 0; k < e.length; k++) edgePos.push(e[k]);
   });
+  const houseMesh = new THREE.Mesh(merge(hg, hc), houseM); houseMesh.castShadow = houseMesh.receiveShadow = true; houses.add(houseMesh);
+  const houseInk = ink => new THREE.Color(1, 1, 1).lerp(new THREE.Color(.16, .19, .27), ink);
   const edgeG = new THREE.BufferGeometry(); edgeG.setAttribute("position", new THREE.Float32BufferAttribute(edgePos, 3));
   const edgeM = new THREE.LineBasicMaterial({ color: "#6b5444", transparent: true, opacity: .35 });
   houses.add(new THREE.LineSegments(edgeG, edgeM));
   scene.add(houses);
 
   // pipes: real tubes in open trenches, and flat "drawn" ribbons
-  const tubeM = new THREE.MeshPhysicalMaterial({ color: C.pe, roughness: .32, clearcoat: .6, clearcoatRoughness: .25, transparent: true });
+  const tubeM = new THREE.MeshStandardMaterial({ color: C.pe, roughness: .3, metalness: .05, transparent: true });
   const trenchM = new THREE.MeshStandardMaterial({ color: "#3d2a1f", roughness: 1, transparent: true, side: THREE.DoubleSide });
   const spoilM = new THREE.MeshStandardMaterial({ map: soil, color: "#b48a6c", roughness: 1, transparent: true, side: THREE.DoubleSide });
   const flow = flowTexture();
   const ribM = { p63: new THREE.MeshBasicMaterial({ color: C.pe.clone(), map: flow, transparent: true, opacity: 0, fog: false, depthWrite: false, side: THREE.DoubleSide }) };
   ribM.p32 = ribM.p63.clone(); ribM.p20 = ribM.p63.clone(); ribM.p90 = ribM.p63.clone();
   const tubes = new THREE.Group(), ribbons = new THREE.Group();
-  let main = null;
+  const tg = [], trg = [], spg = [], rbg = {};
   data.pipes.forEach(({ b, p }) => {
-    const L = len(p);
-    if (b === "p63" && (!main || L > main.L)) main = { p, L };
-    const r = b === "p63" ? .07 : .045;
+    const L = len(p), r = b === "p63" ? .07 : .045;
     const path = new THREE.CurvePath(); for (let i = 1; i < p.length; i++) path.add(new THREE.LineCurve3(V(p[i - 1][0], r + .02, p[i - 1][1]), V(p[i][0], r + .02, p[i][1])));
-    const t = new THREE.Mesh(new THREE.TubeGeometry(path, Math.max(8, Math.ceil(L / 1.5)), r, 16, false), tubeM); t.castShadow = true; tubes.add(t);
-    const tr = new THREE.Mesh(ribbon(p, .55, .012), trenchM); tr.receiveShadow = true; tubes.add(tr);
-    const sp = new THREE.Mesh(heap(p, .4, 1.3, .38), spoilM); sp.castShadow = sp.receiveShadow = true; tubes.add(sp);
-    const rb = new THREE.Mesh(ribbon(p, b === "p63" ? 2.2 : 1.6, .2, 14), ribM[b] || ribM.p63); rb.renderOrder = 6; ribbons.add(rb);
+    tg.push(new THREE.TubeGeometry(path, Math.max(6, Math.ceil(L / 3)), r, 10, false));
+    trg.push(ribbon(p, .55, .012)); spg.push(heap(p, .4, 1.3, .38));
+    (rbg[ribM[b] ? b : "p63"] ||= []).push(ribbon(p, b === "p63" ? 2.2 : 1.6, .2, 14));
   });
+  const tm = new THREE.Mesh(merge(tg), tubeM); tm.castShadow = true;
+  const trm = new THREE.Mesh(merge(trg), trenchM); trm.receiveShadow = true;
+  const spm = new THREE.Mesh(merge(spg), spoilM); spm.castShadow = spm.receiveShadow = true;
+  tubes.add(tm, trm, spm);
+  Object.entries(rbg).forEach(([k, gs]) => { const m = new THREE.Mesh(merge(gs), ribM[k]); m.renderOrder = 6; ribbons.add(m); });
   scene.add(tubes, ribbons);
 
   // camera path, anchored on the longest Ø63 run
@@ -171,7 +195,8 @@ export async function init(canvas, drawingURL) {
   resize(); addEventListener("resize", resize);
 
   const pos = V(), look = V(), ink = C.ink, haze = C.haze;
-  let progress = 0, time = 0, last = performance.now(), running = true;
+  // target = raw scroll position; cur eases toward it so the camera glides instead of stepping
+  let target = 0, cur = 0, time = 0, last = performance.now(), running = true, slow = 0, frames = 0;
   const sample = p => {
     let k = 0; while (k < K.length - 2 && p > K[k + 1].t) k++;
     const A = K[k], B = K[k + 1], t = ramp(p, A.t, B.t);
@@ -181,7 +206,9 @@ export async function init(canvas, drawingURL) {
   function frame(now) {
     const dt = Math.min(.05, (now - last) / 1000); last = now; time += dt;
     if (running) {
-      const p = progress;
+      cur += (target - cur) * (1 - Math.exp(-dt * 7));
+      if (Math.abs(target - cur) < 1e-5) cur = target;
+      const p = cur;
       sample(p);
       const sway = (1 - ramp(p, .1, .3));            // handheld drift near the trench
       pos.x += Math.sin(time * .6) * .08 * sway; pos.y += Math.sin(time * .9) * .05 * sway;
@@ -200,24 +227,32 @@ export async function init(canvas, drawingURL) {
       flow.offset.x -= dt * .35;
 
       const flat = ramp(p, .64, .8);
+      const noSun = ramp(p, .58, .68); sun.intensity = 2.6 * (1 - noSun); hemi.intensity = 1.1 + 1.3 * noSun; // fade shadows instead of switching them off (no shader recompile)
       houses.scale.y = Math.max(.002, 1 - flat);
-      houseMats.forEach((m, j) => m.color.copy(tones[j]).lerp(ink, flat));
+      houseM.color.copy(houseInk(flat));
       edgeM.color.set("#6b5444").lerp(C.sand, toInk); edgeM.opacity = .35 + .2 * toInk;
       houses.visible = ramp(p, .84, .92) < 1;
       edgeM.opacity *= 1 - ramp(p, .84, .92);
       groundM.opacity = 1 - ramp(p, .64, .78); roadM.opacity = groundM.opacity;
       ground.visible = groundM.opacity > .01;
       drawM.opacity = ramp(p, .76, .9);
-      sun.castShadow = p < .7;
-
       renderer.render(scene, camera);
+
+      // if this device can't keep up, drop resolution a step (never below 1x)
+      frames++; if (dt > .024) slow++;
+      if (frames === 45) { if (slow > 25 && dpr > 1) { dpr = Math.max(1, dpr - .25); renderer.setPixelRatio(dpr); resize(); } frames = slow = 0; }
     }
     requestAnimationFrame(frame);
   }
+  // draw shadows once and compile every shader up front, so nothing hitches mid-scroll
+  renderer.shadowMap.needsUpdate = true;
+  renderer.compile(scene, camera);
+  sample(0); camera.position.copy(pos); camera.lookAt(look); renderer.render(scene, camera);
   requestAnimationFrame(frame);
 
   return {
-    set progress(p) { progress = clamp(p); },
+    set progress(p) { target = clamp(p); },
+    get progress() { return cur; },
     set running(v) { running = v; },
     height: () => camera.position.y,
   };

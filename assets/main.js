@@ -166,15 +166,6 @@ document.querySelectorAll("form[data-form]").forEach(form => {
 /* ---------- motion layer ---------- */
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-// smooth scrolling
-let lenis = null;
-if (!reduceMotion && window.Lenis) {
-  lenis = new Lenis({ lerp: .09, wheelMultiplier: 1 });
-  document.querySelectorAll('a[href^="#"]').forEach(a => a.addEventListener("click", e => {
-    const t = document.querySelector(a.getAttribute("href")); if (t) { e.preventDefault(); lenis.scrollTo(t, { offset: -72 }); }
-  }));
-}
-
 // split headings into words that rise in once
 document.querySelectorAll(".rise").forEach(h => {
   h.innerHTML = h.textContent.trim().split(/\s+/).map((w, i) => `<span class="sw"><span style="--i:${i}">${w}</span></span>`).join(" ");
@@ -198,7 +189,6 @@ function setShift() {
 setShift(); addEventListener("resize", setShift); addEventListener("load", setShift);
 
 function tick(t) {
-  lenis && lenis.raf(t);
   const vh = innerHeight;
   for (const el of scrubs) {
     const r = el.getBoundingClientRect();
@@ -206,13 +196,14 @@ function tick(t) {
     const span = el.classList.contains("statement") || el.classList.contains("process") ? r.height + vh * .4 : r.height - vh;
     const start = el.classList.contains("statement") || el.classList.contains("process") ? vh * .8 : 0;
     const p = Math.min(1, Math.max(0, (start - r.top) / Math.max(1, span)));
-    el.style.setProperty("--p", p.toFixed(4));
+    const shown = el === scrolly && window.__scene ? window.__scene.progress : p;
+    if (el === scrolly && window.__scene) window.__scene.progress = p;
+    const v = shown.toFixed(4); if (el.dataset.p !== v) { el.dataset.p = v; el.style.setProperty("--p", v); }
     if (el === scrolly && hdr) { hdr.classList.toggle("past", r.bottom < 72); hdr.classList.toggle("on-dark", p > .66 && r.bottom > 72); }
     if (el === scrolly && window.__scene) {
-      window.__scene.progress = p;
       window.__scene.running = r.bottom > 0 && r.top < vh && !document.hidden;
       if (alt) alt.textContent = window.__scene.height().toFixed(1);
-      scrolly.classList.toggle("end", p > .84);
+      scrolly.classList.toggle("end", shown > .84);
     }
   }
   requestAnimationFrame(tick);
